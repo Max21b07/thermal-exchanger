@@ -288,7 +288,8 @@ def display_recommendation(comparison):
                 st.write(f"**Contrainte eau:** {metrics['constraint_ok']}")
                 st.write(f"**Débit eau:** {metrics['avg_water_flow_th']} t/h")
                 st.write(f"**Score:** {metrics['overall_score']:.0f}/100")
-            st.progress(metrics['overall_score']/100, text=f"Perf: {metrics['overall_score']:.0f}%")
+            st.progress(min(1.0, max(0.0, metrics['overall_score']/100)),
+                        text=f"Perf: {metrics['overall_score']:.0f}%")
 
     st.divider()
     if fastest_robust:
