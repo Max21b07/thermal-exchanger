@@ -1,204 +1,128 @@
-"""Control logic for cooling system scenarios."""
+"""Control logic for cooling system modes."""
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Tuple
 from enum import Enum
 
 
-class ControlType(Enum):
-    """Type of control strategy."""
-    NONE = "none"
-    WATER_FLOW = "water_flow"
-    PRODUCT_BYPASS = "product_bypass"
-    SINGLE_PASS_FLOW = "single_pass_flow"
-
-
 @dataclass
-class PIDController:
-    """Simple PID controller."""
+class PIDState:
+    """PID controller state."""
     Kp: float = 1.0
     Ti: float = 100.0  # Integral time [s]
     Td: float = 0.0    # Derivative time [s]
 
-    setpoint: float = 0.0
     integral: float = 0.0
     prev_error: float = 0.0
     prev_time: float = 0.0
 
-    output_min: float = 0.0
-    output_max: float = 10.0
 
-    def reset(self):
-        """Reset controller state."""
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.prev_time = 0.0
-
-    def compute(self, measured: float, time: float) -> float:
-        """Compute PID output.
-
-        Args:
-            measured: Measured value
-            time: Current time [s]
-
-        Returns:
-            Control output
-        """
-        error = self.setpoint - measured
-
-        dt = time - self.prev_time if self.prev_time > 0 else 0.0
-
-        if dt > 0:
-            derivative = (error - self.prev_error) / dt
-        else:
-            derivative = 0.0
-
-        self.integral += error * dt
-
-        # Anti-windup
-        max_integral = 1000.0
-        self.integral = np.clip(self.integral, -max_integral, max_integral)
-
-        output = (self.Kp * error +
-                  self.Kp / self.Ti * self.integral +
-                  self.Kp * self.Td * derivative)
-
-        output = np.clip(output, self.output_min, self.output_max)
-
-        self.prev_error = error
-        self.prev_time = time
-
-        return output
-
-
-class CoolingController:
-    """Controller for cooling system scenarios."""
-
-    def __init__(self, control_type: ControlType):
-        self.control_type = control_type
-        self.pid_water = PIDController(Kp=2.0, Ti=60.0, Td=0.0)
-        self.pid_product = PIDController(Kp=1.0, Ti=30.0, Td=0.0)
-
-    def reset(self):
-        """Reset all controller states."""
-        self.pid_water.reset()
-        self.pid_product.reset()
-
-    def compute(self, state, architecture, time: float) -> Tuple[float, float]:
-        """Compute control actions.
-
-        Args:
-            state: Current simulation state
-            architecture: Architecture enum
-            time: Current time [s]
-
-        Returns:
-            (water_flow_multiplier, product_fraction_through)
-        """
-        if self.control_type == ControlType.NONE:
-            return 1.0, 1.0
-
-        elif self.control_type == ControlType.WATER_FLOW:
-            # Control water outlet temperature to max allowed
-            self.pid_water.setpoint = 35.5  # Slightly below max for margin
-            water_multiplier = self.pid_water.compute(state.T_water_out, time)
-
-            # Water flow can vary from 30% to 150% of nominal
-            water_multiplier = np.clip(1.0 + water_multiplier * 0.1, 0.3, 1.5)
-            return water_multiplier, 1.0
-
-        elif self.control_type == ControlType.PRODUCT_BYPASS:
-            # Control product temperature via bypass
-            # When tank temp is high, send more product through exchanger
-            self.pid_product.setpoint = 70.0  # Target temp for control
-
-            product_fraction = self.pid_product.compute(state.T_product, time)
-            product_fraction = np.clip(0.2 + product_fraction * 0.05, 0.1, 1.0)
-
-            return 1.0, product_fraction
-
-        elif self.control_type == ControlType.SINGLE_PASS_FLOW:
-            # Control product flow to maintain outlet temp at target
-            # For single pass, we control the flow rate to achieve desired exit temp
-            if state.T_product_out > 65.0:
-                flow_mult = 1.2  # Increase flow to reduce heat transfer
-            elif state.T_product_out < 55.0:
-                flow_mult = 0.8  # Decrease flow to increase heat transfer
-            else:
-                flow_mult = 1.0
-
-            return 1.0, flow_mult
-
-        return 1.0, 1.0
-
-
-def apply_control_logic(state, architecture: str, time: float,
-                       water_flow_nominal: float,
-                       product_flow_nominal: float,
-                       pid_water: PIDController = None,
-                       pid_product: PIDController = None) -> Tuple[float, float]:
-    """Apply control logic based on architecture.
+def pid_compute(pid: PIDState, error: float, time: float,
+                output_min: float = -1e9, output_max: float = 1e9) -> float:
+    """Compute PID output.
 
     Args:
-        state: Current state
-        architecture: Architecture string
-        time: Current time
-        water_flow_nominal: Nominal water flow [kg/s]
-        product_flow_nominal: Nominal product flow [kg/s]
-        pid_water: Water temperature PID controller
-        pid_product: Product temperature PID controller
+        pid: PID state
+        error: Current error (setpoint - measured)
+        time: Current time [s]
+        output_min: Minimum output value
+        output_max: Maximum output value
 
     Returns:
-        (water_flow_actual, product_flow_actual)
+        Control output
     """
-    if architecture == "recirc_no_control":
-        return water_flow_nominal, product_flow_nominal
+    dt = time - pid.prev_time if pid.prev_time > 0 else 0.0
 
-    elif architecture == "recirc_water_control":
-        # PID control on water outlet temperature
-        if pid_water is None:
-            return water_flow_nominal, product_flow_nominal
+    # Proportional
+    P = pid.Kp * error
 
-        # Target: keep water outlet below 36°C
-        error = state.T_water_out - 36.0
-        pid_water.integral += error * 0.1
+    # Integral with anti-windup
+    if dt > 0:
+        pid.integral += error * dt
 
-        # Clamp integral term
-        pid_water.integral = np.clip(pid_water.integral, -100, 100)
+    # Clamp integral
+    max_integral = 1000.0
+    pid.integral = np.clip(pid.integral, -max_integral, max_integral)
+    I = (pid.Kp / pid.Ti) * pid.integral if pid.Ti > 0 else 0.0
 
-        # PID output modifies water flow
-        output = (pid_water.Kp * error +
-                  pid_water.Ki * pid_water.integral)
+    # Derivative
+    D = 0.0
+    if dt > 0 and pid.Td > 0:
+        D = pid.Kp * pid.Td * (error - pid.prev_error) / dt
 
-        water_mult = np.clip(1.0 + output * 0.05, 0.5, 2.0)
-        return water_flow_nominal * water_mult, product_flow_nominal
+    output = P + I + D
+    output = np.clip(output, output_min, output_max)
 
-    elif architecture == "recirc_bypass":
-        # Bypass control - water at max, product fraction controlled
-        water_mult = 1.0  # Water at maximum
+    pid.prev_error = error
+    pid.prev_time = time
 
-        # Control product fraction based on tank temperature
-        if state.T_product > 120.0:
-            frac = 1.0  # Full flow through exchanger when hot
-        elif state.T_product < 80.0:
-            frac = 0.3  # Reduce flow when cooler
-        else:
-            frac = 0.6
+    return output
 
-        return water_flow_nominal * water_mult, product_flow_nominal * frac
 
-    elif architecture == "single_pass":
-        # Single pass - control product flow based on outlet temp
-        if state.T_product_out > 62.0:
-            # Too hot, reduce flow
-            flow_mult = 0.85
-        elif state.T_product_out < 58.0:
-            # Too cold, increase flow
-            flow_mult = 1.15
-        else:
-            flow_mult = 1.0
+def reset_pid(pid: PIDState):
+    """Reset PID state."""
+    pid.integral = 0.0
+    pid.prev_error = 0.0
+    pid.prev_time = 0.0
 
-        return water_flow_nominal, product_flow_nominal * flow_mult
 
+def compute_mode1_no_control(water_flow_nominal: float, product_flow_nominal: float,
+                              **kwargs) -> Tuple[float, float]:
+    """Mode 1: No control - fixed flows."""
     return water_flow_nominal, product_flow_nominal
+
+
+def compute_mode2_water_control(T_water_out: float, water_flow_nominal: float,
+                                 time: float, pid: PIDState,
+                                 setpoint: float = 36.0) -> Tuple[float, PIDState]:
+    """Mode 2: Control water flow to maintain T_water_out <= 36°C.
+
+    Variable manipulated: water flow rate
+    """
+    error = T_water_out - setpoint
+    output = pid_compute(pid, error, time, output_min=-0.5, output_max=0.5)
+
+    # Modify water flow: 0.5x to 1.5x nominal
+    flow_mult = 1.0 + output
+    flow_mult = np.clip(flow_mult, 0.5, 1.5)
+
+    return water_flow_nominal * flow_mult, pid
+
+
+def compute_mode3_bypass_control(T_tank: float, product_flow_nominal: float,
+                                  time: float, pid: PIDState) -> Tuple[float, PIDState]:
+    """Mode 3: Control product fraction through exchanger.
+
+    Water at MAX (1000 t/h assumed). PID controls product fraction.
+    Objective: reach 60°C fastest.
+    """
+    # Target: tank temp reaching 60°C
+    # When hot, full flow through exchanger. When cold, reduce.
+    setpoint = 75.0  # Target tank temp for control logic
+
+    error = T_tank - setpoint
+    output = pid_compute(pid, error, time, output_min=-0.5, output_max=0.5)
+
+    # Product fraction: 0.2 to 1.0
+    frac = 0.5 - output
+    frac = np.clip(frac, 0.2, 1.0)
+
+    return frac, pid
+
+
+def compute_mode4_single_pass(T_product_out: float, product_flow_nominal: float,
+                               time: float, pid: PIDState,
+                               setpoint: float = 60.0) -> Tuple[float, PIDState]:
+    """Mode 4: Control product flow to maintain T_out = 60°C.
+
+    Single pass - no tank accumulation.
+    """
+    error = T_product_out - setpoint
+    output = pid_compute(pid, error, time, output_min=-0.3, output_max=0.3)
+
+    # Flow multiplier: 0.7 to 1.3
+    flow_mult = 1.0 + output
+    flow_mult = np.clip(flow_mult, 0.7, 1.3)
+
+    return product_flow_nominal * flow_mult, pid

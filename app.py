@@ -1,4 +1,7 @@
-"""Streamlit application for industrial batch cooling simulation."""
+"""Streamlit application for industrial batch cooling simulation.
+
+PFD-style interface with block-based parameter entry.
+"""
 
 import streamlit as st
 import numpy as np
@@ -7,131 +10,156 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from model import ProductFluid, CoolingWater, HeatExchanger, Architecture
-from simulation import BatchCoolingSimulator, SimulationConfig, create_comparison_table
+from model import ProductBatch, CoolingWater, HeatExchanger, Architecture
+from simulation import BatchCoolingSimulator, SimulationConfig, run_all_modes, create_comparison_dataframe
 
 st.set_page_config(
-    page_title="Refroidissement Batch Industriel",
+    page_title="Industrial Batch Cooling Simulator",
     page_icon="🏭",
     layout="wide"
 )
 
 
-def init_session_state():
-    """Initialize session state."""
-    if 'results' not in st.session_state:
-        st.session_state.results = None
-    if 'comparison' not in st.session_state:
-        st.session_state.comparison = None
-    if 'config' not in st.session_state:
-        st.session_state.config = None
+# Mode names
+MODE_NAMES = {
+    "mode1_no_control": "1 - Sans contrôle",
+    "mode2_water_control": "2 - Contrôle débit eau",
+    "mode3_bypass": "3 - Bypass produit",
+    "mode4_single_pass": "4 - Passage unique"
+}
+
+MODE_COLORS = {
+    "mode1_no_control": "#e74c3c",
+    "mode2_water_control": "#3498db",
+    "mode3_bypass": "#27ae60",
+    "mode4_single_pass": "#9b59b6"
+}
+
+MODE_DESCRIPTIONS = {
+    "mode1_no_control": "Débit fixe, pas de contrôle",
+    "mode2_water_control": "PID contrôle débit eau → T° sortie ≤ 36°C",
+    "mode3_bypass": "Eau max, PID contrôle fraction produit",
+    "mode4_single_pass": "Passage unique, contrôle débit → T° sortie = 60°C"
+}
 
 
-def render_sidebar():
-    """Render sidebar with all input parameters."""
-    st.sidebar.header("🔧 Paramètres du Procédé")
-
-    # Product parameters
-    st.sidebar.subheader("📦 Produit (Cuve)")
-    mass = st.sidebar.number_input("Masse batch [kg]", 50, 10000, 500, 10)
-    Cp_product = st.sidebar.number_input("Cp produit [J/(kg·K)]", 1000, 4000, 2200, 50)
-    density = st.sidebar.number_input("Densité [kg/m³]", 500, 1500, 900, 10)
-    initial_temp = st.sidebar.number_input("T° initiale [°C]", 100, 200, 150, 5)
-    flow_rate_product = st.sidebar.number_input("Débit recirculation [kg/s]", 0.1, 10.0, 1.0, 0.1)
-
-    # Water parameters
-    st.sidebar.subheader("💧 Eau de Refroidissement")
-    flow_rate_water = st.sidebar.number_input("Débit eau [kg/s]", 0.1, 20.0, 3.0, 0.5)
-    water_inlet_temp = st.sidebar.number_input("T° entrée eau [°C]", 20, 40, 28, 1)
-    max_water_temp = st.sidebar.number_input("T° sortie max [°C]", 30, 50, 36, 1)
-
-    # Exchanger parameters
-    st.sidebar.subheader("🔥 Échangeur")
-    area = st.sidebar.number_input("Surface A [m²]", 0.5, 50.0, 10.0, 0.5)
-    U = st.sidebar.number_input("Coefficient U [W/(m²·K)]", 50, 2000, 400, 50)
-    fouling = st.sidebar.number_input("Fouling factor [m²·K/W]", 0.0, 0.001, 0.0001, 0.00005)
-
-    # Simulation parameters
-    st.sidebar.subheader("⏱️ Simulation")
-    t_end = st.sidebar.number_input("Durée max [s]", 60, 7200, 1800, 60)
-    target_temp = st.sidebar.number_input("T° cible [°C]", 40, 100, 60, 5)
-
-    # Scenario selection
-    st.sidebar.subheader("🎯 Scénario")
-    scenario_options = {
-        "Tous les scénarios (comparaison)": "all",
-        "1 - Recirculation sans contrôle": "recirc_no_control",
-        "2 - Recirculation avec contrôle T° eau": "recirc_water_control",
-        "3 - Recirculation avec bypass": "recirc_bypass",
-        "4 - Passage unique (single pass)": "single_pass"
-    }
-    selected_scenario = st.sidebar.selectbox("Scénario", list(scenario_options.keys()))
-
+def industrial_preset():
+    """Return industrial case preset parameters."""
     return {
-        "product": ProductFluid(
-            mass=mass, Cp=Cp_product, density=density,
-            initial_temp=initial_temp, flow_rate=flow_rate_product
-        ),
-        "water": CoolingWater(
-            flow_rate=flow_rate_water, inlet_temp=water_inlet_temp,
-            max_outlet_temp=max_water_temp, Cp=4184.0
-        ),
-        "exchanger": HeatExchanger(
-            area=area, U=U, fouling_factor=fouling
-        ),
-        "scenario": scenario_options[selected_scenario],
-        "t_end": t_end,
-        "target_temp": target_temp
+        "batch_mass": 45000,       # kg
+        "Cp_product": 2200,        # J/(kg·K)
+        "density": 900,            # kg/m³
+        "T_initial": 150,          # °C
+        "recirculation_flow": 50,   # kg/s (180 t/h)
+        "water_flow": 111,         # kg/s (400 t/h)
+        "water_inlet": 28,         # °C
+        "water_max_outlet": 36,    # °C
+        "exchanger_area": 100,     # m²
+        "U_value": 600,            # W/(m²·K)
+        "max_batch_time": 3600     # 60 minutes
     }
 
 
-def run_single_simulation(params: dict, arch: Architecture) -> dict:
-    """Run a single scenario simulation."""
-    config = SimulationConfig(
-        product=params["product"],
-        water=params["water"],
-        exchanger=params["exchanger"],
-        architecture=arch,
-        t_end=params["t_end"],
-        target_temp=params["target_temp"]
-    )
-
-    sim = BatchCoolingSimulator(config)
-    return sim.run_simulation()
-
-
-def plot_temperature_comparison(results_dict: dict, target_temp: float):
-    """Plot temperature comparison for all scenarios."""
+def render_pfd_schematic():
+    """Render a simple PFD schematic using Plotly."""
     fig = go.Figure()
 
-    colors = {
-        "recirc_no_control": "#e74c3c",
-        "recirc_water_control": "#3498db",
-        "recirc_bypass": "#27ae60",
-        "single_pass": "#9b59b6"
-    }
+    # Tank (cuve)
+    fig.add_shape(type="rect", x0=0.1, y0=0.3, x1=0.25, y1=0.7,
+                  fillcolor="#ffcccb", line=dict(color="#e74c3c", width=2),
+                  name="Cuve")
 
-    names = {
-        "recirc_no_control": "Sans contrôle",
-        "recirc_water_control": "Contrôle T° eau",
-        "recirc_bypass": "Bypass produit",
-        "single_pass": "Passage unique"
-    }
+    # Exchanger
+    fig.add_shape(type="rect", x0=0.55, y0=0.35, x1=0.75, y1=0.65,
+                  fillcolor="#ffe4b5", line=dict(color="#f39c12", width=2),
+                  name="Échangeur")
+
+    # Water connection (bottom)
+    fig.add_shape(type="rect", x0=0.55, y0=0.1, x1=0.75, y1=0.25,
+                  fillcolor="#add8e6", line=dict(color="#3498db", width=2),
+                  name="Eau")
+
+    # Arrows and annotations
+    annotations = [
+        dict(x=0.17, y=0.8, text="Cuve", showarrow=False, font=dict(size=12)),
+        dict(x=0.65, y=0.8, text="Échangeur", showarrow=False, font=dict(size=12)),
+        dict(x=0.65, y=0.05, text="Eau", showarrow=False, font=dict(size=10)),
+        dict(x=0.4, y=0.5, text="Produit", showarrow=False, font=dict(size=9)),
+        dict(x=0.5, y=0.2, text="Eau froide", showarrow=False, font=dict(size=9)),
+        dict(x=0.8, y=0.5, text="Produit\nrefroidi", showarrow=False, font=dict(size=9)),
+    ]
+
+    fig.update_layout(
+        annotations=annotations,
+        xaxis=dict(range=[0, 1], showgrid=False, showticklabels=False),
+        yaxis=dict(range=[0, 1], showgrid=False, showticklabels=False),
+        height=200,
+        margin=dict(l=20, r=20, t=30, b=20),
+        showlegend=False,
+        plot_bgcolor="white"
+    )
+
+    return fig
+
+
+def render_block_parameter(key: str, label: str, icon: str,
+                           fields: dict, default_values: dict,
+                           col=None):
+    """Render a parameter block with fields."""
+    if col:
+        with col:
+            with st.container():
+                st.markdown(f"**{icon} {label}**")
+                values = {}
+                for field_key, field_info in fields.items():
+                    default = default_values.get(field_key, field_info.get("default", 0))
+                    values[field_key] = st.number_input(
+                        field_info["label"],
+                        min_value=field_info.get("min", 0),
+                        max_value=field_info.get("max", 1e6),
+                        value=default,
+                        step=field_info.get("step", 1),
+                        key=f"{key}_{field_key}",
+                        label_visibility="collapsed"
+                    )
+                return values
+    else:
+        st.markdown(f"**{icon} {label}**")
+        values = {}
+        for field_key, field_info in fields.items():
+            default = default_values.get(field_key, field_info.get("default", 0))
+            values[field_key] = st.number_input(
+                field_info["label"],
+                min_value=field_info.get("min", 0),
+                max_value=field_info.get("max", 1e6),
+                value=default,
+                step=field_info.get("step", 1),
+                key=f"{key}_{field_key}",
+                label_visibility="collapsed"
+            )
+        return values
+
+
+def plot_temperature_evolution(results_dict: dict, target_temp: float):
+    """Plot temperature evolution for all modes."""
+    fig = go.Figure()
 
     for name, results in results_dict.items():
+        color = MODE_COLORS.get(name, "#333")
+        label = MODE_NAMES.get(name, name)
+
         fig.add_trace(go.Scatter(
-            x=results.t, y=results.T_product,
-            name=f"{names[name]} - Cuve",
-            line=dict(color=colors[name], width=2),
-            opacity=0.9
+            x=results.t, y=results.T_tank,
+            name=f"{label} - Cuve",
+            line=dict(color=color, width=2.5),
+            hovertemplate="t=%{x:.0f}s<br>T=%{y:.1f}°C"
         ))
 
-    # Add target line
     fig.add_hline(y=target_temp, line_dash="dash", line_color="gray",
                   annotation_text=f"Cible: {target_temp}°C")
 
     fig.update_layout(
-        title="Comparaison - Température Cuve/Produit",
+        title="Température Cuve / Produit vs Temps",
         xaxis_title="Temps [s]",
         yaxis_title="Température [°C]",
         hovermode="x unified",
@@ -142,28 +170,18 @@ def plot_temperature_comparison(results_dict: dict, target_temp: float):
 
 
 def plot_water_temperature(results_dict: dict, max_allowed: float):
-    """Plot water outlet temperatures."""
+    """Plot water outlet temperature for all modes."""
     fig = go.Figure()
 
-    colors = {
-        "recirc_no_control": "#e74c3c",
-        "recirc_water_control": "#3498db",
-        "recirc_bypass": "#27ae60",
-        "single_pass": "#9b59b6"
-    }
-
-    names = {
-        "recirc_no_control": "Sans contrôle",
-        "recirc_water_control": "Contrôle T° eau",
-        "recirc_bypass": "Bypass produit",
-        "single_pass": "Passage unique"
-    }
-
     for name, results in results_dict.items():
+        color = MODE_COLORS.get(name, "#333")
+        label = MODE_NAMES.get(name, name)
+
         fig.add_trace(go.Scatter(
             x=results.t, y=results.T_water_out,
-            name=f"{names[name]} - Eau",
-            line=dict(color=colors[name], width=2, dash="dot")
+            name=label,
+            line=dict(color=color, width=2, dash="dot"),
+            hovertemplate="t=%{x:.0f}s<br>T_eau=%{y:.1f}°C"
         ))
 
     fig.add_hline(y=max_allowed, line_dash="dash", line_color="red",
@@ -180,328 +198,409 @@ def plot_water_temperature(results_dict: dict, max_allowed: float):
     return fig
 
 
-def plot_power_transfer(results_dict: dict):
-    """Plot heat transfer power."""
-    fig = go.Figure()
-
-    colors = {
-        "recirc_no_control": "#e74c3c",
-        "recirc_water_control": "#3498db",
-        "recirc_bypass": "#27ae60",
-        "single_pass": "#9b59b6"
-    }
-
-    names = {
-        "recirc_no_control": "Sans contrôle",
-        "recirc_water_control": "Contrôle T° eau",
-        "recirc_bypass": "Bypass produit",
-        "single_pass": "Passage unique"
-    }
+def plot_power_and_energy(results_dict: dict):
+    """Plot power transfer and cumulative energy."""
+    fig = make_subplots(rows=1, cols=2,
+                       subplot_titles=["Puissance Thermique [kW]", "Énergie Cumulée [MJ]"])
 
     for name, results in results_dict.items():
-        fig.add_trace(go.Scatter(
-            x=results.t, y=results.Q / 1000,
-            name=names[name],
-            line=dict(color=colors[name], width=2),
-            fill='tozeroy' if name == "recirc_no_control" else None
-        ))
+        color = MODE_COLORS.get(name, "#333")
+        label = MODE_NAMES.get(name, name)
 
-    fig.update_layout(
-        title="Puissance Thermique Transférée",
-        xaxis_title="Temps [s]",
-        yaxis_title="Puissance [kW]",
-        hovermode="x unified",
-        height=300
-    )
+        fig.add_trace(go.Scatter(
+            x=results.t, y=results.Q_W / 1000,
+            name=label,
+            line=dict(color=color, width=2),
+            showlegend=False
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=results.t, y=results.energy_J / 1e6,
+            name=label,
+            line=dict(color=color, width=2),
+            showlegend=True
+        ), row=1, col=2)
+
+    fig.update_layout(height=350, hovermode="x unified")
+    fig.update_xaxes(title_text="Temps [s]", row=1, col=1)
+    fig.update_xaxes(title_text="Temps [s]", row=1, col=2)
+    fig.update_yaxes(title_text="kW", row=1, col=1)
+    fig.update_yaxes(title_text="MJ", row=1, col=2)
 
     return fig
 
 
-def plot_overlay_all(results_dict: dict, target_temp: float):
-    """Create overlay plot with all temperatures."""
+def plot_overlay_all(results_dict: dict, target_temp: float, max_water: float):
+    """Create comprehensive overlay plot."""
     fig = make_subplots(rows=2, cols=2,
-                       subplot_titles=("Température Produit", "Température Eau",
-                                      "Puissance Thermique", "Énergie Cumulée"))
-
-    colors = {
-        "recirc_no_control": "#e74c3c",
-        "recirc_water_control": "#3498db",
-        "recirc_bypass": "#27ae60",
-        "single_pass": "#9b59b6"
-    }
-
-    names = {
-        "recirc_no_control": "Sans contrôle",
-        "recirc_water_control": "Contrôle T° eau",
-        "recirc_bypass": "Bypass produit",
-        "single_pass": "Passage unique"
-    }
+                       subplot_titles=("T° Cuve [°C]", "T° Eau Sortie [°C]",
+                                      "Puissance [kW]", "Énergie [MJ]"))
 
     for name, results in results_dict.items():
-        color = colors[name]
-        label = names[name]
+        color = MODE_COLORS.get(name, "#333")
 
-        # Product temperature (row 1, col 1)
+        # T° Cuve
         fig.add_trace(go.Scatter(
-            x=results.t, y=results.T_product, name=label,
+            x=results.t, y=results.T_tank,
             line=dict(color=color, width=2), showlegend=False
         ), row=1, col=1)
 
-        # Water temperature (row 1, col 2)
+        # T° Eau
         fig.add_trace(go.Scatter(
-            x=results.t, y=results.T_water_out, name=label,
-            line=dict(color=color, width=2, dash="dot"), showlegend=True
+            x=results.t, y=results.T_water_out,
+            line=dict(color=color, width=2, dash="dot"), showlegend=False
         ), row=1, col=2)
 
-        # Power (row 2, col 1)
+        # Power
         fig.add_trace(go.Scatter(
-            x=results.t, y=results.Q/1000, name=label,
+            x=results.t, y=results.Q_W / 1000,
             line=dict(color=color, width=2), showlegend=False
         ), row=2, col=1)
 
-        # Energy (row 2, col 2)
+        # Energy
         fig.add_trace(go.Scatter(
-            x=results.t, y=results.energy/1e6, name=label,
+            x=results.t, y=results.energy_J / 1e6,
             line=dict(color=color, width=2), showlegend=False
         ), row=2, col=2)
 
-    # Add target line to first subplot
+    # Reference lines
     fig.add_hline(y=target_temp, line_dash="dash", line_color="gray", row=1, col=1)
+    fig.add_hline(y=max_water, line_dash="dash", line_color="red", row=1, col=2)
 
-    # Add max water temp line to second subplot
-    fig.add_hline(y=36, line_dash="dash", line_color="red", row=1, col=2)
-
-    fig.update_layout(height=700, showlegend=True,
+    fig.update_layout(height=600, showlegend=True,
                       title_text="Vue Overlay - Tous les Scénarios")
 
     fig.update_xaxes(title_text="Temps [s]", row=2, col=1)
     fig.update_xaxes(title_text="Temps [s]", row=2, col=2)
-    fig.update_yaxes(title_text="T° [°C]", row=1, col=1)
-    fig.update_yaxes(title_text="T° [°C]", row=1, col=2)
-    fig.update_yaxes(title_text="Puissance [kW]", row=2, col=1)
-    fig.update_yaxes(title_text="Énergie [MJ]", row=2, col=2)
 
     return fig
 
 
-def display_comparison_table(comparison: dict, target_temp: float):
-    """Display comparison table with metrics."""
+def display_comparison_table(comparison: dict, max_time: float):
+    """Display comparison table with color coding."""
     data = []
     for name, metrics in comparison.items():
-        names = {
-            "recirc_no_control": "Sans contrôle",
-            "recirc_water_control": "Contrôle T° eau",
-            "recirc_bypass": "Bypass produit",
-            "single_pass": "Passage unique"
+        row = {
+            "Mode": metrics["name"],
+            "Temps à 60°C": metrics["time_to_60C"],
+            "Contrainte eau": metrics["constraint_ok"],
+            "Énergie [MJ]": metrics["total_energy_MJ"],
+            "Puiss. moy. [kW]": metrics["avg_power_kW"],
+            "Débit eau [t/h]": metrics["avg_water_flow_th"],
+            "Score": f"{metrics['overall_score']:.0f}/100"
         }
-
-        constraint_icon = "✅" if metrics["constraint_met"] else "❌"
-
-        data.append({
-            "Scénario": names.get(name, name),
-            "Temps à 60°C [s]": metrics["time_to_60°C"],
-            "Énergie [MJ]": f"{metrics['total_energy_MJ']:.2f}",
-            "Puissance moy. [kW]": f"{metrics['avg_power_kW']:.1f}",
-            "T° eau max [°C]": metrics["max_water_temp"],
-            "Contrainte eau": constraint_icon,
-            "Coût proxy": f"{metrics['pumping_proxy']:.2f}"
-        })
+        data.append(row)
 
     df = pd.DataFrame(data)
 
-    # Style the dataframe
-    def highlight_constraint(row):
-        if row["Contrainte eau"] == "✅":
-            return ["background-color: #d4edda"] * len(row)
+    # Style function
+    def style_row(row):
+        styles = [""] * len(row)
+        # Constraint column (index 2)
+        if "❌" in str(row["Contrainte eau"]):
+            styles[2] = "background-color: #ffe6e6"
         else:
-            return ["background-color: #f8d7da"] * len(row)
+            styles[2] = "background-color: #e6ffe6"
+        return styles
 
     st.dataframe(
-        df.style.apply(highlight_constraint, axis=1),
+        df.style.apply(style_row, axis=1),
         use_container_width=True,
-        height=200
+        height=180
     )
 
     return df
 
 
 def display_recommendation(comparison: dict):
-    """Display engineering recommendation based on results."""
-    st.subheader("📋 Recommandation Procédure")
+    """Display engineering recommendation."""
+    # Find best by overall score
+    best = max(comparison.items(), key=lambda x: x[1]["overall_score"])
 
-    # Find best scenario for different criteria
-    fastest = min(comparison.items(), key=lambda x: x[1]["time_to_60°C_s"])
-    most_efficient = min(comparison.items(), key=lambda x: x[1]["total_energy_MJ"])
-    respects_constraint = [(k, v) for k, v in comparison.items() if v["constraint_met"]]
-    most_robust = min(respects_constraint, key=lambda x: x[1]["time_to_60°C_s"]) if respects_constraint else None
-
-    names = {
-        "recirc_no_control": "Sans contrôle",
-        "recirc_water_control": "Contrôle T° eau",
-        "recirc_bypass": "Bypass produit",
-        "single_pass": "Passage unique"
-    }
+    # Find fastest respecting constraint
+    respecting = [(k, v) for k, v in comparison.items() if v["constraint_violation_C"] == 0]
+    fastest_robust = min(respecting, key=lambda x: x[1]["time_to_60C_s"]) if respecting else None
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.metric("⏱️ Plus rapide", names.get(fastest[0], fastest[0]),
-                 f"{fastest[1]['time_to_60°C']}")
-        st.caption(f"Énergie: {fastest[1]['total_energy_MJ']:.1f} MJ")
+        st.metric("🏆 Meilleur score", best[1]["name"],
+                 f"{best[1]['overall_score']:.0f}/100")
 
     with col2:
-        if most_robust:
-            st.metric("🛡️ Plus robuste", names.get(most_robust[0], most_robust[0]),
-                     f"Contrainte respectée")
+        if fastest_robust:
+            st.metric("⚡ Plus rapide (robuste)", fastest_robust[1]["name"],
+                     fastest_robust[1]["time_to_60C"])
         else:
-            st.metric("🛡️ Plus robuste", "Aucun", "Tous dépassent la contrainte")
+            st.metric("⚡ Plus rapide", "Aucun", "Contrainte non respectée")
 
     with col3:
-        st.metric("⚡ Plus économe", names.get(most_efficient[0], most_efficient[0]),
-                 f"{most_efficient[1]['total_energy_MJ']:.1f} MJ")
+        violated = [(k, v) for k, v in comparison.items() if v["constraint_violation_C"] > 0]
+        st.metric("⚠️ Modes en violation", str(len(violated)),
+                 f"+{violated[0][1]['constraint_violation_C']:.1f}°C") if violated else st.metric("⚠️ Modes en violation", "0", "Tous OK")
 
-    st.markdown("---")
+    st.divider()
 
-    # Overall recommendation
-    if most_robust:
+    # Detailed analysis
+    st.subheader("📋 Analyse Détaillée")
+
+    for name, metrics in comparison.items():
+        with st.expander(f"{metrics['name']}"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write(f"**Temps à 60°C:** {metrics['time_to_60C']}")
+                st.write(f"**Énergie totale:** {metrics['total_energy_MJ']} MJ")
+                st.write(f"**Puissance moyenne:** {metrics['avg_power_kW']} kW")
+
+            with col_b:
+                st.write(f"**Contrainte eau:** {metrics['constraint_ok']}")
+                st.write(f"**Débit eau moyen:** {metrics['avg_water_flow_th']} t/h")
+                st.write(f"**Score global:** {metrics['overall_score']:.0f}/100")
+
+            # Score breakdown
+            st.progress(metrics['overall_score'] / 100,
+                        text=f"Performance: {metrics['overall_score']:.0f}%")
+
+    # Conclusion
+    st.divider()
+    if fastest_robust:
         st.success(f"""
-        **Conclusion:** L'architecture **'{names.get(most_robust[0])}'** est recommandée.
+        **Recommandation:** Le mode **'{fastest_robust[1]['name']}'** est recommandé.
 
-        - Atteint 60°C en {most_robust[1]['time_to_60°C']}
+        - Atteint 60°C en {fastest_robust[1]['time_to_60C']}
         - Respecte la contrainte T° eau ≤ 36°C
-        - Solution balance performance/robustesse
+        - Bon compromis performance/robustesse
         """)
     else:
         st.warning("""
-        **Attention:** Aucun scénario ne respecte la contrainte de température eau maximale.
-        Considerer: augmentation du débit eau ou surface d'échange.
+        **Attention:** Aucun mode ne respecte la contrainte de température eau maximale.
+        Considerer: augmenter le débit eau ou la surface d'échange.
         """)
 
 
-def export_to_csv(results_dict: dict, comparison: dict):
-    """Export results to CSV."""
-    csv_data = []
-
+def export_csv(results_dict: dict):
+    """Export all results to CSV."""
+    rows = []
     for name, results in results_dict.items():
         for i in range(len(results.t)):
-            csv_data.append({
-                "scenario": name,
+            rows.append({
+                "mode": name,
                 "time_s": results.t[i],
-                "T_product_C": results.T_product[i],
+                "T_tank_C": results.T_tank[i],
                 "T_water_out_C": results.T_water_out[i],
-                "Q_W": results.Q[i],
-                "energy_J": results.energy[i] if i < len(results.energy) else 0
+                "Q_W": results.Q_W[i],
+                "energy_J": results.energy_J[i]
             })
-
-    df = pd.DataFrame(csv_data)
+    df = pd.DataFrame(rows)
     return df.to_csv(index=False)
 
 
 def main():
-    init_session_state()
-
-    st.title("🏭 Refroidissement Batch - Simulation Échangeur Thermique")
+    st.title("🏭 Industrial Batch Cooling Simulator")
     st.markdown("""
-    **Contexte:** Refroidissement d'additifs pour huiles de lubrification moteur.
-    Batch à 150°C → 60°C via échangeur tubes et calandre, eau de réfrigération à 28°C.
+    **Contexte:** Refroidissement batch industriel via échangeur tubes et calandre.
+    Comparison de 4 architectures de refroidissement sous contrainte utilités.
     """)
 
-    params = render_sidebar()
+    # Industrial preset button
+    col_preset, col_spacer = st.columns([1, 4])
+    with col_preset:
+        if st.button("🏭 Industrial Case Preset (45t batch)", use_container_width=True):
+            st.session_state.preset = industrial_preset()
+            st.rerun()
 
-    # Run button
-    col1, col2 = st.columns([1, 3])
-    with col1:
+    # Initialize preset
+    if 'preset' not in st.session_state:
+        st.session_state.preset = {
+            "batch_mass": 500, "Cp_product": 2200, "density": 900,
+            "T_initial": 150, "recirculation_flow": 1.0,
+            "water_flow": 10, "water_inlet": 28, "water_max_outlet": 36,
+            "exchanger_area": 10, "U_value": 500, "max_batch_time": 3600
+        }
+
+    preset = st.session_state.preset
+
+    # === PFD Schematic ===
+    st.subheader("📊 Schéma Procédé (PFD)")
+    fig_pfd = render_pfd_schematic()
+    st.plotly_chart(fig_pfd, use_container_width=True)
+
+    st.divider()
+
+    # === Parameter Blocks ===
+    st.subheader("🔧 Configuration des Paramètres")
+
+    col_prod, col_hex, col_water, col_ctrl = st.columns(4)
+
+    # Product block
+    with col_prod:
+        st.markdown("### 📦 Produit (Cuve)")
+        batch_mass = st.number_input("Masse batch [kg]", 100, 100000, preset["batch_mass"], 100, key="batch_mass")
+        Cp = st.number_input("Cp [J/(kg·K)]", 1000, 4000, preset["Cp_product"], 50, key="Cp")
+        density = st.number_input("Densité [kg/m³]", 500, 1500, preset["density"], 10, key="density")
+        T_init = st.number_input("T° initiale [°C]", 50, 250, preset["T_initial"], 5, key="T_init")
+        recirculation = st.number_input("Débit recirculation [kg/s]", 1, 200, preset["recirculation_flow"], 1, key="recirculation")
+
+    # Exchanger block
+    with col_hex:
+        st.markdown("### 🔥 Échangeur")
+        A = st.number_input("Surface A [m²]", 1, 300, preset["exchanger_area"], 1, key="A")
+        U = st.number_input("Coefficient U [W/(m²·K)]", 100, 2000, preset["U_value"], 50, key="U")
+
+    # Water block
+    with col_water:
+        st.markdown("### 💧 Eau Refroidissement")
+        water_flow = st.number_input("Débit eau [kg/s]", 1, 500, preset["water_flow"], 1, key="water_flow")
+        T_water_in = st.number_input("T° entrée [°C]", 15, 40, preset["water_inlet"], 1, key="T_water_in")
+        T_water_max = st.number_input("T° sortie max [°C]", 30, 50, preset["water_max_outlet"], 1, key="T_water_max")
+
+    # Control block
+    with col_ctrl:
+        st.markdown("### ⏱️ Contraintes & Mode")
+        target_temp = st.number_input("T° cible [°C]", 30, 120, 60, 5, key="target")
+        max_time = st.number_input("Temps max batch [s]", 300, 7200, preset["max_batch_time"], 60, key="max_time")
+        max_time_min = max_time / 60
+
+        st.write(f"**Contrainte:** {max_time_min:.0f} min")
+
+        mode_options = ["Tous les modes (comparaison)", "Mode 1 - Sans contrôle",
+                       "Mode 2 - Contrôle débit eau", "Mode 3 - Bypass produit",
+                       "Mode 4 - Passage unique"]
+        selected_mode = st.selectbox("Mode à simuler", mode_options, key="mode_select")
+
+    # Update preset with current values for next load
+    st.session_state.preset = {
+        "batch_mass": batch_mass, "Cp_product": Cp, "density": density,
+        "T_initial": T_init, "recirculation_flow": recirculation,
+        "water_flow": water_flow, "water_inlet": T_water_in, "water_max_outlet": T_water_max,
+        "exchanger_area": A, "U_value": U, "max_batch_time": max_time
+    }
+
+    st.divider()
+
+    # === Run Simulation ===
+    col_run, col_export = st.columns([1, 3])
+    with col_run:
         run_clicked = st.button("▶️ Lancer Simulation", type="primary", use_container_width=True)
 
-    with col2:
-        if st.button("📊 Exporter CSV", use_container_width=True):
-            if st.session_state.results:
-                csv = export_to_csv(st.session_state.results, st.session_state.comparison)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name="batch_cooling_results.csv",
-                    mime="text/csv"
-                )
+    with col_export:
+        if st.session_state.get('results') and st.button("📊 Exporter CSV", use_container_width=True):
+            csv = export_csv(st.session_state.results)
+            st.download_button(
+                label="Download CSV",
+                data=csv,
+                file_name="batch_cooling_results.csv",
+                mime="text/csv"
+            )
 
+    # Run simulation
     if run_clicked:
         with st.spinner("Simulation en cours..."):
-            results_dict = {}
+            # Create config
+            batch = ProductBatch(
+                mass=batch_mass, Cp=Cp, density=density,
+                initial_temp=T_init, recirculation_flow=recirculation
+            )
+            water = CoolingWater(
+                flow_rate=water_flow, inlet_temp=T_water_in,
+                max_outlet_temp=T_water_max
+            )
+            exchanger = HeatExchanger(area=A, U=U)
 
-            if params["scenario"] == "all":
-                architectures = [
-                    Architecture.RECIRC_NO_CONTROL,
-                    Architecture.RECIRC_WATER_TEMP_CONTROL,
-                    Architecture.RECIRC_BYPASS,
-                    Architecture.SINGLE_PASS
-                ]
+            config = SimulationConfig(
+                batch=batch, water=water, exchanger=exchanger,
+                max_batch_time=max_time, target_temp=target_temp
+            )
+
+            # Run selected mode(s)
+            if selected_mode == "Tous les modes (comparaison)":
+                results_dict = run_all_modes(config)
             else:
-                arch_map = {
-                    "recirc_no_control": Architecture.RECIRC_NO_CONTROL,
-                    "recirc_water_control": Architecture.RECIRC_WATER_TEMP_CONTROL,
-                    "recirc_bypass": Architecture.RECIRC_BYPASS,
-                    "single_pass": Architecture.SINGLE_PASS
+                mode_map = {
+                    "Mode 1 - Sans contrôle": "mode1_no_control",
+                    "Mode 2 - Contrôle débit eau": "mode2_water_control",
+                    "Mode 3 - Bypass produit": "mode3_bypass",
+                    "Mode 4 - Passage unique": "mode4_single_pass"
                 }
-                architectures = [arch_map[params["scenario"]]]
+                mode_key = mode_map.get(selected_mode, "mode1_no_control")
 
-            for arch in architectures:
-                results_dict[arch.value] = run_single_simulation(params, arch)
+                from model import Architecture
+                arch_map = {
+                    "mode1_no_control": Architecture.RECIRC_NO_CONTROL,
+                    "mode2_water_control": Architecture.RECIRC_WATER_CONTROL,
+                    "mode3_bypass": Architecture.RECIRC_BYPASS,
+                    "mode4_single_pass": Architecture.SINGLE_PASS
+                }
+
+                cfg = SimulationConfig(
+                    batch=batch, water=water, exchanger=exchanger,
+                    max_batch_time=max_time, target_temp=target_temp,
+                    mode=arch_map[mode_key]
+                )
+                sim = BatchCoolingSimulator(cfg)
+                results_dict = {mode_key: sim.run()}
 
             st.session_state.results = results_dict
-            st.session_state.comparison = create_comparison_table(results_dict)
-            st.session_state.config = params
+            st.session_state.comparison = create_comparison_dataframe(results_dict, max_time)
+            st.session_state.config = config
 
-    # Display results
-    if st.session_state.results:
+    # === Display Results ===
+    if st.session_state.get('results'):
         results_dict = st.session_state.results
         comparison = st.session_state.comparison
 
+        # Quick metrics row
         st.divider()
-        st.subheader("📈 Résultats")
+        st.subheader("📈 Métriques Clés")
 
-        # Quick metrics
         cols = st.columns(len(results_dict))
-        names = {
-            "recirc_no_control": "Sans contrôle",
-            "recirc_water_control": "Contrôle T° eau",
-            "recirc_bypass": "Bypass",
-            "single_pass": "Single pass"
-        }
-
         for col, (name, results) in zip(cols, results_dict.items()):
             with col:
-                time_str = results.time_to_target if results.time_to_target else "—"
-                if results.time_to_target:
-                    time_str = f"{results.time_to_target:.0f}s"
-                st.metric(f"{names.get(name, name)}", time_str, f"{results.avg_power/1000:.1f} kW moy")
+                time_str = f"{results.time_to_60C_s:.0f}s" if results.time_to_60C_s else "—"
+                st.metric(MODE_NAMES.get(name, name), time_str,
+                         f"{results.avg_power_kW:.0f} kW moy")
+
+        # Detailed constraint check
+        st.write("**Respect contrainte eau (36°C max):**")
+        constraint_cols = st.columns(len(results_dict))
+        for col, (name, results) in zip(constraint_cols, results_dict.items()):
+            with col:
+                if results.constraint_satisfied:
+                    st.success(f"✅ {MODE_NAMES.get(name, name)}")
+                else:
+                    st.error(f"❌ {MODE_NAMES.get(name, name)}: +{results.constraint_violation_max_C:.1f}°C")
 
         # Plots
-        tab_single, tab_overlay, tab_water, tab_power = st.tabs([
-            "Scénarios Individuels", "Vue Overlay", "Eau Refroidissement", "Puissance"
+        st.divider()
+        st.subheader("📉 Graphiques")
+
+        tab_overlay, tab_temp, tab_water, tab_power = st.tabs([
+            "Vue Overlay", "Températures Cuve", "Eau Refroidissement", "Puissance"
         ])
 
-        with tab_single:
-            fig = plot_temperature_comparison(results_dict, params["target_temp"])
+        with tab_overlay:
+            fig = plot_overlay_all(results_dict, target_temp, T_water_max)
             st.plotly_chart(fig, use_container_width=True)
 
-        with tab_overlay:
-            fig = plot_overlay_all(results_dict, params["target_temp"])
+        with tab_temp:
+            fig = plot_temperature_evolution(results_dict, target_temp)
             st.plotly_chart(fig, use_container_width=True)
 
         with tab_water:
-            fig = plot_water_temperature(results_dict, params["water"].max_outlet_temp)
+            fig = plot_water_temperature(results_dict, T_water_max)
             st.plotly_chart(fig, use_container_width=True)
 
         with tab_power:
-            fig = plot_power_transfer(results_dict)
+            fig = plot_power_and_energy(results_dict)
             st.plotly_chart(fig, use_container_width=True)
 
         # Comparison table
         st.divider()
-        st.subheader("📊 Analyse Comparative")
+        st.subheader("📊 Tableau Comparatif")
 
-        df = display_comparison_table(comparison, params["target_temp"])
+        display_comparison_table(comparison, max_time)
 
+        # Recommendation
         display_recommendation(comparison)
 
         # Detailed data
@@ -509,40 +608,27 @@ def main():
         st.subheader("📋 Données Détaillées")
 
         for name, results in results_dict.items():
-            with st.expander(f"Données - {names.get(name, name)}"):
-                df_detail = pd.DataFrame({
+            with st.expander(f"Données - {MODE_NAMES.get(name, name)}"):
+                df = pd.DataFrame({
                     "t [s]": results.t,
-                    "T_prod [°C]": results.T_product,
+                    "T_cuve [°C]": results.T_tank,
                     "T_eau_sortie [°C]": results.T_water_out,
-                    "Q [kW]": results.Q / 1000,
-                    "Énergie [MJ]": results.energy / 1e6
+                    "Q [kW]": results.Q_W / 1000,
+                    "Énergie [MJ]": results.energy_J / 1e6
                 })
-                st.dataframe(df_detail, use_container_width=True, height=200)
+                st.dataframe(df, use_container_width=True, height=200)
 
     else:
-        # Default info display
+        # Default state
         st.divider()
-        st.subheader("ℹ️ Configuration")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Produit**")
-            st.write(f"- Masse: {params['product'].mass} kg")
-            st.write(f"- Cp: {params['product'].Cp} J/(kg·K)")
-            st.write(f"- T° initiale: {params['product'].initial_temp}°C")
-            st.write(f"- Débit: {params['product'].flow_rate} kg/s")
-
-        with col2:
-            st.markdown("**Eau Refroidissement**")
-            st.write(f"- Débit: {params['water'].flow_rate} kg/s")
-            st.write(f"- T° entrée: {params['water'].inlet_temp}°C")
-            st.write(f"- T° sortie max: {params['water'].max_outlet_temp}°C")
-
-        st.markdown("**Échangeur**")
-        st.write(f"- Surface: {params['exchanger'].area} m²")
-        st.write(f"- U: {params['exchanger'].U} W/(m²·K)")
-
-        st.info("👈 Configurez les paramètres et cliquez sur 'Lancer Simulation'")
+        st.info("👆 Configurez les paramètres ci-dessus et cliquez sur 'Lancer Simulation'")
+        st.markdown("""
+        **Mode d'emploi:**
+        1. Utilisez le preset "Industrial Case" ou saisissez vos paramètres
+        2. Sélectionnez le mode à simuler (ou tous)
+        3. Cliquez sur Lancer
+        4. Comparez les résultats et contraintes
+        """)
 
 
 if __name__ == "__main__":
