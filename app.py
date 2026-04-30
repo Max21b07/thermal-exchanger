@@ -88,70 +88,66 @@ def render_pfd_schematic():
 
     fig = go.Figure()
 
-    # Define all PFD elements with better positions
-    # Tank (cuve) - large rectangle on left
+    # Tank (cuve)
     fig.add_shape(type="rect", x0=0.05, y0=0.2, x1=0.18, y1=0.75,
-                  fillcolor="#ffcccc", line=dict(color="#c0392b", width=3),
-                  layer="below")
+                  fillcolor="#ffcccc", line=dict(color="#c0392b", width=3))
     fig.add_annotation(x=0.115, y=0.85, text="<b>CUVE</b><br>Produit", showarrow=False,
                        font=dict(size=14, color="#c0392b"), align="center")
 
-    # Pump symbol (triangle for pump)
+    # Pump
     fig.add_shape(type="circle", x0=0.28, y0=0.42, x1=0.33, y1=0.55,
                   fillcolor="#e74c3c", line=dict(color="#c0392b", width=2))
     fig.add_annotation(x=0.305, y=0.35, text="POMPE", showarrow=False,
                        font=dict(size=9, color="#666"))
 
-    # Heat Exchanger - large rectangle center-right
+    # Heat Exchanger
     fig.add_shape(type="rect", x0=0.45, y0=0.15, x1=0.7, y1=0.82,
-                  fillcolor="#ffeaa7", line=dict(color="#d68910", width=3),
-                  layer="below")
+                  fillcolor="#ffeaa7", line=dict(color="#d68910", width=3))
     fig.add_annotation(x=0.575, y=0.88, text="<b>ÉCHANGEUR</b><br>Tubes/Calandre", showarrow=False,
                        font=dict(size=12, color="#d68910"), align="center")
 
-    # Water tank (utility) - bottom
+    # Water tank
     fig.add_shape(type="rect", x0=0.45, y0=0.02, x1=0.7, y1=0.12,
-                  fillcolor="#aed6f1", line=dict(color="#2980b9", width=2),
-                  layer="below")
+                  fillcolor="#aed6f1", line=dict(color="#2980b9", width=2))
     fig.add_annotation(x=0.575, y=0.15, text="EAU RÉFRIGÉRATION", showarrow=False,
                        font=dict(size=9, color="#2980b9"))
 
-    # Pipes - horizontal product line (top)
-    fig.add_shape(type="line", x0=0.18, y0=0.55, x1=0.45, y2=0.55,
+    # Product pipe (top)
+    fig.add_shape(type="line", x0=0.18, y0=0.55, x1=0.45, y1=0.55,
                   line=dict(color="#c0392b", width=4))
-    fig.add_annotation(x=0.315, y=0.6, text="Produit chaud", showarrow=False,
+    fig.add_annotation(x=0.315, y=0.62, text="Produit chaud", showarrow=False,
                        font=dict(size=10, color="#c0392b"))
 
-    # Pipe - product to exchanger (angled connection)
-    fig.add_shape(type="line", x0=0.18, y0=0.35, x1=0.45, y2=0.35,
+    # Product pipe return (bottom)
+    fig.add_shape(type="line", x0=0.18, y0=0.35, x1=0.45, y1=0.35,
                   line=dict(color="#27ae60", width=4))
     fig.add_annotation(x=0.315, y=0.28, text="Produit refroidi", showarrow=False,
                        font=dict(size=10, color="#27ae60"))
 
     # Water pipes (bottom)
-    fig.add_shape(type="line", x0=0.35, y0=0.07, x1=0.45, y2=0.07,
+    fig.add_shape(type="line", x0=0.35, y0=0.07, x1=0.45, y1=0.07,
                   line=dict(color="#2980b9", width=3))
-    fig.add_annotation(x=0.28, y=0.04, text="Eau froide 28°C", showarrow=False,
+    fig.add_annotation(x=0.28, y=0.02, text="Eau froide 28°C", showarrow=False,
                        font=dict(size=8, color="#2980b9"))
 
-    fig.add_shape(type="line", x0=0.7, y0=0.07, x1=0.85, y2=0.07,
+    fig.add_shape(type="line", x0=0.7, y0=0.07, x1=0.85, y1=0.07,
                   line=dict(color="#2980b9", width=3))
-    fig.add_annotation(x=0.775, y=0.04, text="Eau chaude →", showarrow=False,
+    fig.add_annotation(x=0.775, y=0.02, text="Eau chaude →", showarrow=False,
                        font=dict(size=8, color="#2980b9"))
 
-    # Valves (small circles)
-    fig.add_shape(type="circle", x0=0.22, y0=0.5, x1=0.25, y2=0.53,
+    # Valves
+    fig.add_shape(type="circle", x0=0.22, y0=0.5, x1=0.25, y1=0.53,
                   fillcolor="#fff", line=dict(color="#333", width=1))
-    fig.add_shape(type="circle", x0=0.4, y0=0.5, x1=0.43, y2=0.53,
+    fig.add_shape(type="circle", x0=0.4, y0=0.5, x1=0.43, y1=0.53,
                   fillcolor="#fff", line=dict(color="#333", width=1))
 
-    # Arrow indicators (triangles)
+    # Arrow
     fig.add_annotation(x=0.4, y=0.55, ax=0.3, ay=0.55,
                       text="→", showarrow=True, arrowhead=2, arrowsize=2,
                       arrowcolor="#c0392b", font=dict(size=16))
 
-    # Flow indicators (dashed for return)
-    fig.add_shape(type="line", x0=0.18, y0=0.35, x1=0.18, y2=0.2,
+    # Return flow dashed
+    fig.add_shape(type="line", x0=0.18, y0=0.35, x1=0.18, y1=0.2,
                   line=dict(color="#27ae60", width=3, dash="dash"))
 
     fig.update_layout(
@@ -161,7 +157,7 @@ def render_pfd_schematic():
         margin=dict(l=10, r=10, t=30, b=20),
         showlegend=False,
         plot_bgcolor="#f8f9fa",
-        paper_bgcolor="#f8f9fa"
+        paper_bgcolor="white"
     )
 
     return fig
