@@ -40,17 +40,17 @@ MODE_COLORS = {
 def industrial_preset():
     """Return industrial case preset parameters."""
     return {
-        "batch_mass": 45000,       # kg
-        "Cp_product": 2200,        # J/(kg·K)
-        "density": 900,            # kg/m³
-        "T_initial": 150,          # °C
-        "recirculation_flow": 50,   # kg/s (180 t/h)
-        "water_flow": 111,         # kg/s (400 t/h)
-        "water_inlet": 28,         # °C
-        "water_max_outlet": 36,    # °C
-        "exchanger_area": 100,     # m²
-        "U_value": 600,            # W/(m²·K)
-        "max_batch_time": 3600     # 60 minutes
+        "batch_mass": 45000.0,       # kg
+        "Cp_product": 2200.0,        # J/(kg·K)
+        "density": 900.0,            # kg/m³
+        "T_initial": 150.0,          # °C
+        "recirculation_flow": 50.0,   # kg/s (180 t/h)
+        "water_flow": 111.0,         # kg/s (400 t/h)
+        "water_inlet": 28.0,         # °C
+        "water_max_outlet": 36.0,    # °C
+        "exchanger_area": 100.0,     # m²
+        "U_value": 600.0,            # W/(m²·K)
+        "max_batch_time": 3600.0     # 60 minutes
     }
 
 
@@ -500,30 +500,30 @@ def main():
     # Product block
     with col_prod:
         st.markdown("### 📦 Produit (Cuve)")
-        batch_mass = st.number_input("Masse batch [kg]", 100, 100000, preset["batch_mass"], 100, key="batch_mass")
-        Cp = st.number_input("Cp [J/(kg·K)]", 1000, 4000, preset["Cp_product"], 50, key="Cp")
-        density = st.number_input("Densité [kg/m³]", 500, 1500, preset["density"], 10, key="density")
-        T_init = st.number_input("T° initiale [°C]", 50, 250, preset["T_initial"], 5, key="T_init")
-        recirculation = st.number_input("Débit recirculation [kg/s]", 1, 200, preset["recirculation_flow"], 1, key="recirculation")
+        batch_mass = st.number_input("Masse batch [kg]", 100.0, 100000.0, float(preset["batch_mass"]), 100.0, key="batch_mass")
+        Cp = st.number_input("Cp [J/(kg·K)]", 1000.0, 4000.0, float(preset["Cp_product"]), 50.0, key="Cp")
+        density = st.number_input("Densité [kg/m³]", 500.0, 1500.0, float(preset["density"]), 10.0, key="density")
+        T_init = st.number_input("T° initiale [°C]", 50.0, 250.0, float(preset["T_initial"]), 5.0, key="T_init")
+        recirculation = st.number_input("Débit recirculation [kg/s]", 1.0, 200.0, float(preset["recirculation_flow"]), 1.0, key="recirculation")
 
     # Exchanger block
     with col_hex:
         st.markdown("### 🔥 Échangeur")
-        A = st.number_input("Surface A [m²]", 1, 300, preset["exchanger_area"], 1, key="A")
-        U = st.number_input("Coefficient U [W/(m²·K)]", 100, 2000, preset["U_value"], 50, key="U")
+        A = st.number_input("Surface A [m²]", 1.0, 300.0, float(preset["exchanger_area"]), 1.0, key="A")
+        U = st.number_input("Coefficient U [W/(m²·K)]", 100.0, 2000.0, float(preset["U_value"]), 50.0, key="U")
 
     # Water block
     with col_water:
         st.markdown("### 💧 Eau Refroidissement")
-        water_flow = st.number_input("Débit eau [kg/s]", 1, 500, preset["water_flow"], 1, key="water_flow")
-        T_water_in = st.number_input("T° entrée [°C]", 15, 40, preset["water_inlet"], 1, key="T_water_in")
-        T_water_max = st.number_input("T° sortie max [°C]", 30, 50, preset["water_max_outlet"], 1, key="T_water_max")
+        water_flow = st.number_input("Débit eau [kg/s]", 1.0, 500.0, float(preset["water_flow"]), 1.0, key="water_flow")
+        T_water_in = st.number_input("T° entrée [°C]", 15.0, 40.0, float(preset["water_inlet"]), 1.0, key="T_water_in")
+        T_water_max = st.number_input("T° sortie max [°C]", 30.0, 50.0, float(preset["water_max_outlet"]), 1.0, key="T_water_max")
 
     # Control block
     with col_ctrl:
         st.markdown("### ⏱️ Contraintes & Mode")
-        target_temp = st.number_input("T° cible [°C]", 30, 120, 60, 5, key="target")
-        max_time = st.number_input("Temps max batch [s]", 300, 7200, preset["max_batch_time"], 60, key="max_time")
+        target_temp = st.number_input("T° cible [°C]", 30.0, 120.0, 60.0, 5.0, key="target")
+        max_time = st.number_input("Temps max batch [s]", 300.0, 7200.0, float(preset["max_batch_time"]), 60.0, key="max_time")
         max_time_min = max_time / 60
 
         st.write(f"**Contrainte:** {max_time_min:.0f} min")
