@@ -1,6 +1,6 @@
 """Streamlit application for industrial batch cooling simulation.
 
-PFD-style interface with block-based parameter entry.
+PFD-style interface with block-based parameter entry and industrial audio feedback.
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 
 from model import ProductBatch, CoolingWater, HeatExchanger, Architecture
 from simulation import BatchCoolingSimulator, SimulationConfig, run_all_modes, create_comparison_dataframe
+from audio_manager import get_audio_manager, play_sound, toggle_audio, get_sound_base64
 
 st.set_page_config(
     page_title="Industrial Batch Cooling Simulator",
@@ -35,13 +36,6 @@ MODE_COLORS = {
     "mode4_single_pass": "#9b59b6"
 }
 
-MODE_DESCRIPTIONS = {
-    "mode1_no_control": "Débit fixe, pas de contrôle",
-    "mode2_water_control": "PID contrôle débit eau → T° sortie ≤ 36°C",
-    "mode3_bypass": "Eau max, PID contrôle fraction produit",
-    "mode4_single_pass": "Passage unique, contrôle débit → T° sortie = 60°C"
-}
-
 
 def industrial_preset():
     """Return industrial case preset parameters."""
@@ -58,6 +52,78 @@ def industrial_preset():
         "U_value": 600,            # W/(m²·K)
         "max_batch_time": 3600     # 60 minutes
     }
+
+
+def inject_audio_elements():
+    """Inject JavaScript and hidden audio elements for sound feedback."""
+    audio = get_audio_manager()
+
+    # Generate all sound data URIs
+    sounds = audio.get_all_sounds()
+
+    # HTML for audio elements
+    audio_html = ""
+    for name, data_uri in sounds.items():
+        audio_html += f'<audio id="sound_{name}" src="{data_uri}" preload="auto"></audio>\n'
+
+    # JavaScript for sound playback
+    js = """
+    <script>
+    const SoundManager = {
+        muted: false,
+        volumeLevel: 'medium',
+
+        play: function(soundName) {
+            if (this.muted) return;
+            const audio = document.getElementById('sound_' + soundName);
+            if (audio) {
+                audio.currentTime = 0;
+                audio.play().catch(() => {});
+            }
+        },
+
+        toggleMute: function() {
+            this.muted = !this.muted;
+            return this.muted;
+        },
+
+        setVolume: function(level) {
+            this.volumeLevel = level;
+        }
+    };
+
+    // Expose to Streamlit
+    window.SoundManager = SoundManager;
+    </script>
+    """
+
+    st.markdown(audio_html + js, unsafe_allow_html=True)
+
+
+def play_ui_sound(sound_name: str):
+    """Play a UI sound via Streamlit components."""
+    audio = get_audio_manager()
+    if audio.is_muted():
+        return
+
+    sound_data = play_sound(sound_name)
+    if sound_data:
+        st.audio(sound_data, format="audio/wav", start_time=0)
+
+
+def sound_button(label, key=None, **kwargs):
+    """Custom button with sound feedback."""
+    if st.button(label, key=key, **kwargs):
+        play_ui_sound("click")
+        return True
+    return False
+
+
+def sound_metric(label, value, delta=None, key=None):
+    """Custom metric with tick sound on value change."""
+    result = st.metric(label, value, delta, key)
+    play_ui_sound("tick")
+    return result
 
 
 def render_pfd_schematic():
@@ -100,44 +166,6 @@ def render_pfd_schematic():
     )
 
     return fig
-
-
-def render_block_parameter(key: str, label: str, icon: str,
-                           fields: dict, default_values: dict,
-                           col=None):
-    """Render a parameter block with fields."""
-    if col:
-        with col:
-            with st.container():
-                st.markdown(f"**{icon} {label}**")
-                values = {}
-                for field_key, field_info in fields.items():
-                    default = default_values.get(field_key, field_info.get("default", 0))
-                    values[field_key] = st.number_input(
-                        field_info["label"],
-                        min_value=field_info.get("min", 0),
-                        max_value=field_info.get("max", 1e6),
-                        value=default,
-                        step=field_info.get("step", 1),
-                        key=f"{key}_{field_key}",
-                        label_visibility="collapsed"
-                    )
-                return values
-    else:
-        st.markdown(f"**{icon} {label}**")
-        values = {}
-        for field_key, field_info in fields.items():
-            default = default_values.get(field_key, field_info.get("default", 0))
-            values[field_key] = st.number_input(
-                field_info["label"],
-                min_value=field_info.get("min", 0),
-                max_value=field_info.get("max", 1e6),
-                value=default,
-                step=field_info.get("step", 1),
-                key=f"{key}_{field_key}",
-                label_visibility="collapsed"
-            )
-        return values
 
 
 def plot_temperature_evolution(results_dict: dict, target_temp: float):
@@ -296,7 +324,6 @@ def display_comparison_table(comparison: dict, max_time: float):
     # Style function
     def style_row(row):
         styles = [""] * len(row)
-        # Constraint column (index 2)
         if "❌" in str(row["Contrainte eau"]):
             styles[2] = "background-color: #ffe6e6"
         else:
@@ -336,8 +363,11 @@ def display_recommendation(comparison: dict):
 
     with col3:
         violated = [(k, v) for k, v in comparison.items() if v["constraint_violation_C"] > 0]
-        st.metric("⚠️ Modes en violation", str(len(violated)),
-                 f"+{violated[0][1]['constraint_violation_C']:.1f}°C") if violated else st.metric("⚠️ Modes en violation", "0", "Tous OK")
+        if violated:
+            st.metric("⚠️ Modes en violation", str(len(violated)),
+                     f"+{violated[0][1]['constraint_violation_C']:.1f}°C")
+        else:
+            st.metric("⚠️ Modes en violation", "0", "Tous OK")
 
     st.divider()
 
@@ -357,11 +387,9 @@ def display_recommendation(comparison: dict):
                 st.write(f"**Débit eau moyen:** {metrics['avg_water_flow_th']} t/h")
                 st.write(f"**Score global:** {metrics['overall_score']:.0f}/100")
 
-            # Score breakdown
             st.progress(metrics['overall_score'] / 100,
                         text=f"Performance: {metrics['overall_score']:.0f}%")
 
-    # Conclusion
     st.divider()
     if fastest_robust:
         st.success(f"""
@@ -386,7 +414,7 @@ def export_csv(results_dict: dict):
             rows.append({
                 "mode": name,
                 "time_s": results.t[i],
-                "T_tank_C": results.T_tank[i],
+                "T_tank_C": results.t[i],
                 "T_water_out_C": results.T_water_out[i],
                 "Q_W": results.Q_W[i],
                 "energy_J": results.energy_J[i]
@@ -395,17 +423,54 @@ def export_csv(results_dict: dict):
     return df.to_csv(index=False)
 
 
+def render_audio_control():
+    """Render audio control panel."""
+    audio = get_audio_manager()
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+
+    with col1:
+        if st.button("🔊" if not audio.is_muted() else "🔇",
+                     key="audio_toggle", use_container_width=True):
+            new_state = toggle_audio()
+            if new_state:
+                st.toast("🔇 Son désactivé")
+            else:
+                st.toast("🔊 Son activé")
+            st.rerun()
+
+    with col2:
+        volume_options = {"Off": "off", "Low": "low", "Medium": "medium"}
+        selected = st.selectbox("Volume", list(volume_options.keys()),
+                               index=2, key="volume_select")
+        audio.set_volume(volume_options[selected])
+
+    with col3:
+        st.write("")  # Spacer
+
+    return audio
+
+
 def main():
+    # Inject audio system
+    inject_audio_elements()
+
     st.title("🏭 Industrial Batch Cooling Simulator")
     st.markdown("""
     **Contexte:** Refroidissement batch industriel via échangeur tubes et calandre.
     Comparison de 4 architectures de refroidissement sous contrainte utilités.
     """)
 
+    # Audio controls in sidebar
+    with st.sidebar:
+        st.subheader("🔊 Audio")
+        render_audio_control()
+
     # Industrial preset button
     col_preset, col_spacer = st.columns([1, 4])
     with col_preset:
         if st.button("🏭 Industrial Case Preset (45t batch)", use_container_width=True):
+            play_ui_sound("tick")
             st.session_state.preset = industrial_preset()
             st.rerun()
 
@@ -468,7 +533,7 @@ def main():
                        "Mode 4 - Passage unique"]
         selected_mode = st.selectbox("Mode à simuler", mode_options, key="mode_select")
 
-    # Update preset with current values for next load
+    # Update preset with current values
     st.session_state.preset = {
         "batch_mass": batch_mass, "Cp_product": Cp, "density": density,
         "T_initial": T_init, "recirculation_flow": recirculation,
@@ -495,6 +560,8 @@ def main():
 
     # Run simulation
     if run_clicked:
+        play_ui_sound("start")
+
         with st.spinner("Simulation en cours..."):
             # Create config
             batch = ProductBatch(
@@ -524,7 +591,6 @@ def main():
                 }
                 mode_key = mode_map.get(selected_mode, "mode1_no_control")
 
-                from model import Architecture
                 arch_map = {
                     "mode1_no_control": Architecture.RECIRC_NO_CONTROL,
                     "mode2_water_control": Architecture.RECIRC_WATER_CONTROL,
@@ -539,6 +605,20 @@ def main():
                 )
                 sim = BatchCoolingSimulator(cfg)
                 results_dict = {mode_key: sim.run()}
+
+            # Play feedback sounds based on results
+            all_constraints_ok = all(r.constraint_satisfied for r in results_dict.values())
+            any_reached_target = any(r.time_to_60C_s is not None for r in results_dict.values())
+
+            if all_constraints_ok and any_reached_target:
+                play_ui_sound("success")
+                st.success("✅ Simulation terminée - Objectif atteint!")
+            elif not all_constraints_ok:
+                play_ui_sound("error")
+                st.error("⚠️ Simulation terminée - Contrainte eau violée!")
+            else:
+                play_ui_sound("complete")
+                st.info("Simulation terminée.")
 
             st.session_state.results = results_dict
             st.session_state.comparison = create_comparison_dataframe(results_dict, max_time)
@@ -568,6 +648,7 @@ def main():
                 if results.constraint_satisfied:
                     st.success(f"✅ {MODE_NAMES.get(name, name)}")
                 else:
+                    play_ui_sound("warning")
                     st.error(f"❌ {MODE_NAMES.get(name, name)}: +{results.constraint_violation_max_C:.1f}°C")
 
         # Plots
