@@ -1,325 +1,322 @@
-"""Heat exchanger simulation engine with dynamic energy balances."""
+"""Batch cooling simulation with multiple architectures."""
 
 import numpy as np
-from typing import Dict, Tuple, Callable, Optional
-from dataclasses import dataclass
+from scipy.integrate import solve_ivp
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
 from enum import Enum
 
-
-class ControlMode(Enum):
-    """Control mode for the simulation."""
-    NO_CONTROL = "no_control"
-    CONTROL_WATER_OUTLET = "water_outlet"
-    CONTROL_PRODUCT_TEMP = "product_temp"
+from model import (ProductFluid, CoolingWater, HeatExchanger, Architecture,
+                   calculate_heat_transfer, energy_balance_tank, energy_balance_single_pass)
+from control import ControlType, apply_control_logic
 
 
 @dataclass
-class SimulationParameters:
-    """All parameters needed for simulation."""
-    # Hot fluid (product recirculating)
-    m_hot: float           # Mass flow rate [kg/s]
-    T_hot_inlet: float     # Inlet temperature [°C]
-    Cp_hot: float          # Specific heat [J/(kg·K)]
-
-    # Cold fluid (refrigeration water)
-    m_cold: float          # Mass flow rate [kg/s]
-    T_cold_inlet: float    # Inlet temperature [°C]
-    Cp_cold: float         # Specific heat [J/(kg·K)]
-
-    # Heat exchanger
-    U: float               # Overall heat transfer coefficient [W/(m²·K)]
-    A: float               # Heat exchange surface [m²]
-
-    # Tank (product)
-    m_tank: float          # Mass of product in tank [kg]
-    Cp_tank: float         # Specific heat of product [J/(kg·K)]
-    T_tank_init: float     # Initial tank temperature [°C]
-
-    # Control parameters
-    control_mode: ControlMode = ControlMode.NO_CONTROL
-    setpoint: float = 0.0          # Target temperature [°C]
-    Kp: float = 1.0                # PID proportional gain
-    Ti: float = 100.0              # PID integral time [s]
-    Td: float = 0.0                # PID derivative time [s]
+class SimulationConfig:
+    """Configuration for simulation."""
+    product: ProductFluid
+    water: CoolingWater
+    exchanger: HeatExchanger
+    architecture: Architecture
+    t_end: float = 1800.0  # 30 minutes default
+    t_eval: Optional[np.ndarray] = None
+    target_temp: float = 60.0  # °C
 
 
-class HeatExchangerModel:
-    """Dynamic heat exchanger with tank model.
+@dataclass
+class SimulationResults:
+    """Results from simulation."""
+    t: np.ndarray
+    T_product: np.ndarray      # Tank temperature or inlet for single pass
+    T_product_out: np.ndarray   # Product outlet temp
+    T_water_in: np.ndarray      # Water inlet temp (constant)
+    T_water_out: np.ndarray     # Water outlet temp
+    Q: np.ndarray               # Heat transfer rate [W]
+    energy: np.ndarray          # Cumulative energy transferred [J]
+    water_flow: np.ndarray      # Water flow rate [kg/s]
+    product_flow: np.ndarray    # Product flow rate [kg/s]
+    product_fraction: np.ndarray  # Fraction through exchanger
+    constraint_satisfied: np.ndarray  # Water temp constraint met
 
-    The system consists of:
-    - A tank containing the product (hot fluid)
-    - A tube-side where product circulates
-    - A shell-side where refrigeration water flows
-    """
+    # Metrics
+    time_to_target: Optional[float] = None
+    total_energy: Optional[float] = None
+    avg_power: Optional[float] = None
+    max_water_temp: Optional[float] = None
 
-    def __init__(self, params: SimulationParameters):
-        self.params = params
-        self.dt = 0.1  # Time step [s]
 
-        # State variables
-        self.T_tank = params.T_tank_init
-        self.T_hot_out = params.T_hot_inlet  # Temperature leaving exchanger toward tank
-        self.T_cold_out = params.T_cold_inlet  # Temperature leaving exchanger
+class BatchCoolingSimulator:
+    """Simulator for batch cooling via heat exchanger."""
 
-        # Control state
-        self.integral_error = 0.0
-        self.prev_error = 0.0
-        self.prev_T_tank = params.T_tank_init
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.product = config.product
+        self.water = config.water
+        self.exchanger = config.exchanger
+        self.architecture = config.architecture
 
-    def reset(self):
-        """Reset to initial conditions."""
-        self.T_tank = self.params.T_tank_init
-        self.T_hot_out = self.params.T_hot_inlet
-        self.T_cold_out = self.params.T_cold_inlet
-        self.integral_error = 0.0
-        self.prev_error = 0.0
-        self.prev_T_tank = self.params.T_tank_init
+        # Controller state
+        self.pid_water_integral = 0.0
+        self.pid_water_prev_error = 0.0
 
-    def calculate_heat_transfer(self, T_hot_in: float, T_cold_in: float) -> Tuple[float, float, float]:
-        """Calculate heat transfer rate using LMTD method.
+    def _derivatives_recirc(self, t: float, y: np.ndarray) -> np.ndarray:
+        """Compute derivatives for recirculation modes.
 
-        Returns:
-            Q: Heat transfer rate [W]
-            T_hot_out: Hot fluid outlet temperature [°C]
-            T_cold_out: Cold fluid outlet temperature [°C]
+        State: [T_product, T_water_out]
         """
-        U = self.params.U
-        A = self.params.A
+        T_product, T_water_out = y
 
-        # Hot fluid enters from tank
-        m_hot = self.params.m_hot
-        Cp_hot = self.params.Cp_hot
+        # Get current flows (controlled)
+        water_flow = self.water.flow_rate
+        product_flow = self.product.flow_rate
+        product_fraction = 1.0
 
-        m_cold = self.params.m_cold
-        Cp_cold = self.params.Cp_cold
+        # Apply control based on architecture
+        if self.architecture == Architecture.RECIRC_WATER_TEMP_CONTROL:
+            # Control water flow to maintain outlet temp <= 36°C
+            error = T_water_out - 36.0
+            self.pid_water_integral += error * 0.5
+            self.pid_water_integral = np.clip(self.pid_water_integral, -50, 50)
+            output = error + 0.02 * self.pid_water_integral
+            water_mult = np.clip(1.0 + output * 0.1, 0.4, 1.5)
+            water_flow = self.water.flow_rate * water_mult
 
-        # Effectiveness-NTU method for better accuracy
-        C_hot = m_hot * Cp_hot
-        C_cold = m_cold * Cp_cold
-        C_min = min(C_hot, C_cold)
-        C_max = max(C_hot, C_cold)
-        C_ratio = C_min / C_max if C_max > 0 else 0
+        elif self.architecture == Architecture.RECIRC_BYPASS:
+            # Bypass control - water at max, product fraction controlled
+            water_flow = self.water.flow_rate  # Max water
+            if T_product > 110.0:
+                product_fraction = 1.0
+            elif T_product < 75.0:
+                product_fraction = 0.25
+            else:
+                product_fraction = 0.5
 
-        # Number of transfer units
-        NTU = U * A / C_min if C_min > 0 else 0
+        elif self.architecture == Architecture.RECIRC_NO_CONTROL:
+            pass  # No control
 
-        # Effectiveness for counter-current flow
-        if NTU <= 0:
-            epsilon = 0
-        elif C_ratio == 1:
-            epsilon = NTU / (1 + NTU)
-        else:
-            epsilon = (1 - np.exp(-NTU * (1 - C_ratio))) / (1 - C_ratio * np.exp(-NTU * (1 - C_ratio)))
+        # Heat transfer calculation
+        Q, T_product_out_calc, T_water_out_calc, _ = calculate_heat_transfer(
+            T_product, self.water.inlet_temp,
+            self.product, self.water, self.exchanger, product_fraction
+        )
 
-        # Maximum possible heat transfer
-        dT_max = T_hot_in - self.params.T_cold_inlet
-        Q_max = C_min * dT_max if dT_max > 0 else 0
+        # Tank energy balance: dT/dt = -Q / (m * Cp)
+        dT_product_dt = -Q / (self.product.mass * self.product.Cp)
 
-        # Actual heat transfer
-        Q = epsilon * Q_max
+        # Water side - simplified as flow-through (small thermal mass)
+        C_water = water_flow * self.water.Cp
+        dT_water_dt = Q / C_water if C_water > 0 else 0
 
-        # Outlet temperatures
-        if C_hot > 0:
-            T_hot_out = T_hot_in - Q / C_hot
-        else:
-            T_hot_out = T_hot_in
+        return np.array([dT_product_dt, dT_water_dt])
 
-        if C_cold > 0:
-            T_cold_out = self.params.T_cold_inlet + Q / C_cold
-        else:
-            T_cold_out = self.params.T_cold_inlet
+    def _derivatives_single_pass(self, t: float, y: np.ndarray) -> np.ndarray:
+        """Compute derivatives for single pass mode.
 
-        return Q, T_hot_out, T_cold_out
-
-    def calculate_LMTD(self, T_hot_in: float, T_hot_out: float,
-                       T_cold_in: float, T_cold_out: float) -> float:
-        """Calculate LMTD for counter-current flow."""
-        dT1 = T_hot_in - T_cold_out
-        dT2 = T_hot_out - T_cold_in
-
-        if abs(dT1 - dT2) < 0.01 or dT1 / dT2 <= 0:
-            return (dT1 + dT2) / 2
-
-        return (dT1 - dT2) / np.log(dT1 / dT2)
-
-    def update_control(self, Q: float, dt: float) -> float:
-        """Update control action and return new mass flow rate modifier.
-
-        Returns multiplier for cold water flow rate.
+        For single pass, product flows once through exchanger.
+        State: [T_product_out] - outlet temp of product
         """
-        if self.params.control_mode == ControlMode.NO_CONTROL:
-            return 1.0
+        T_product_in = self.product.initial_temp
+        T_product_out = y[0]
 
-        error = self.params.setpoint - self.T_tank
+        # Control product flow based on outlet temperature
+        product_flow = self.product.flow_rate
 
-        if self.params.control_mode == ControlMode.CONTROL_PRODUCT_TEMP:
-            # PID control for tank temperature
-            self.integral_error += error * dt
+        if T_product_out > 62.0:
+            product_flow *= 0.9  # Reduce flow to increase residence time
+        elif T_product_out < 58.0:
+            product_flow *= 1.1  # Increase flow to decrease residence time
 
-            # Anti-windup
-            max_integral = 1000
-            self.integral_error = max(-max_integral, min(max_integral, self.integral_error))
-
-            derivative = (error - self.prev_error) / dt if dt > 0 else 0
-
-            # PID output
-            output = (self.params.Kp * error +
-                     self.params.Kp / self.params.Ti * self.integral_error +
-                     self.params.Kp * self.params.Td * derivative)
-
-            self.prev_error = error
-
-            # Limit flow rate adjustment (0.5 to 2x)
-            multiplier = np.clip(1.0 + output * 0.01, 0.5, 2.0)
-            return multiplier
-
-        elif self.params.control_mode == ControlMode.CONTROL_WATER_OUTLET:
-            # Control cold water outlet temperature
-            error_water = self.params.setpoint - self.T_cold_out
-
-            self.integral_error += error_water * dt
-            self.integral_error = max(-500, min(500, self.integral_error))
-
-            output = (self.params.Kp * error_water +
-                     self.params.Kp / self.params.Ti * self.integral_error)
-
-            multiplier = np.clip(1.0 + output * 0.1, 0.3, 2.5)
-            return multiplier
-
-        return 1.0
-
-    def step(self, dt: float = None) -> Dict[str, float]:
-        """Perform one simulation step.
-
-        Returns dictionary with current state values.
-        """
-        if dt is None:
-            dt = self.dt
-
-        # Heat exchanger inlet temperatures
-        T_hot_in = self.T_tank  # Hot fluid comes from tank
-        T_cold_in = self.params.T_cold_inlet  # Cold water inlet
+        product_flow = np.clip(product_flow, 0.1, 2.0 * self.product.flow_rate)
 
         # Calculate heat transfer
-        Q, T_hot_out, T_cold_out = self.calculate_heat_transfer(T_hot_in, T_cold_in)
+        Q, _, T_water_out_calc, _ = calculate_heat_transfer(
+            T_product_in, self.water.inlet_temp,
+            self.product, self.water, self.exchanger, 1.0
+        )
 
-        # Apply control
-        flow_multiplier = self.update_control(Q, dt)
+        # Product outlet temp change rate
+        C_product = product_flow * self.product.Cp
+        dT_out_dt = -Q / C_product if C_product > 0 else 0
 
-        # Update state variables
-        self.T_hot_out = T_hot_out
-        self.T_cold_out = T_cold_out
+        return np.array([dT_out_dt])
 
-        # Tank energy balance
-        # dT_tank/dt = (Q_in - Q_out) / (m_tank * Cp_tank)
-        # Q_in = m_hot * Cp_hot * T_hot_out (from exchanger returning)
-        # Actually the tank receives cooled product back, so:
-        # The tank loses heat to the exchanger
-
-        dT_tank = Q / (self.params.m_tank * self.params.Cp_tank)
-        self.T_tank = self.T_tank - dT_tank * dt  # Tank temperature decreases as heat is removed
-
-        return {
-            'time': 0,  # Will be set by simulator
-            'T_tank': self.T_tank,
-            'T_hot_out': self.T_hot_out,
-            'T_cold_out': self.T_cold_out,
-            'Q': Q,
-            'flow_multiplier': flow_multiplier
-        }
-
-
-class Simulator:
-    """Simulator that runs the heat exchanger model over time."""
-
-    def __init__(self, params: SimulationParameters):
-        self.params = params
-        self.model = HeatExchangerModel(params)
-        self.results = {
-            'time': [],
-            'T_tank': [],
-            'T_hot_out': [],
-            'T_cold_out': [],
-            'Q': [],
-            'energy': [],
-            'flow_multiplier': []
-        }
-        self.time = 0.0
-        self.total_energy = 0.0
-        self.dt = 0.5  # Simulation time step
-
-    def reset(self):
-        """Reset simulation to initial conditions."""
-        self.model.reset()
-        self.results = {k: [] for k in self.results}
-        self.time = 0.0
-        self.total_energy = 0.0
-
-    def run(self, duration: float, dt: float = None, target_temp: float = None) -> Dict:
-        """Run simulation for specified duration.
-
-        Args:
-            duration: Simulation duration [s]
-            dt: Time step for recording results
-            target_temp: Target temperature to stop at
+    def run_simulation(self) -> SimulationResults:
+        """Run the simulation.
 
         Returns:
-            Dictionary with simulation results
+            SimulationResults object
         """
-        if dt is None:
-            dt = self.dt
+        # Time span
+        t_span = (0.0, self.config.t_end)
 
-        self.reset()
-        t = 0.0
-        n_steps = int(duration / dt)
+        # Initial conditions
+        if self.architecture == Architecture.SINGLE_PASS:
+            y0 = np.array([self.product.initial_temp])
+        else:
+            y0 = np.array([self.product.initial_temp, self.water.inlet_temp])
 
-        for i in range(n_steps):
-            # Run multiple internal steps for accuracy
-            internal_dt = dt / 10
-            for _ in range(10):
-                state = self.model.step(internal_dt)
+        # Custom event for target temperature reached
+        def event(t, y):
+            if self.architecture == Architecture.SINGLE_PASS:
+                return y[0] - self.config.target_temp
+            else:
+                return y[0] - self.config.target_temp
 
-            t += dt
-            self.time = t
+        event.terminal = True
+        event.direction = -1  # We want T to go DOWN to target
 
-            # Accumulate energy
-            Q = state['Q']
-            self.total_energy += Q * dt
+        # Solve ODE
+        if self.architecture == Architecture.SINGLE_PASS:
+            sol = solve_ivp(
+                self._derivatives_single_pass,
+                t_span, y0,
+                events=event,
+                dense_output=True,
+                max_step=1.0
+            )
+        else:
+            sol = solve_ivp(
+                self._derivatives_recirc,
+                t_span, y0,
+                events=event,
+                dense_output=True,
+                max_step=1.0
+            )
 
-            # Store results
-            self.results['time'].append(t)
-            self.results['T_tank'].append(self.model.T_tank)
-            self.results['T_hot_out'].append(self.model.T_hot_out)
-            self.results['T_cold_out'].append(self.model.T_cold_out)
-            self.results['Q'].append(Q)
-            self.results['flow_multiplier'].append(state['flow_multiplier'])
-            self.results['energy'].append(self.total_energy)
+        t_eval = sol.t
+        y_eval = sol.y
 
-            # Check stop condition
-            if target_temp is not None:
-                if self.model.T_tank <= target_temp:
-                    break
+        # Build results
+        n = len(t_eval)
 
-        self.results['total_energy'] = self.total_energy
-        self.results['final_time'] = t
-        self.results['target_reached'] = target_temp is not None and self.model.T_tank <= target_temp
+        if self.architecture == Architecture.SINGLE_PASS:
+            T_product = np.full(n, self.product.initial_temp)  # Inlet constant
+            T_product_out = y_eval[0]
+            T_water_out = np.zeros(n)
+            water_flow = np.full(n, self.water.flow_rate)
+            product_flow = np.full(n, self.product.flow_rate)
+            product_fraction = np.ones(n)
+        else:
+            T_product = y_eval[0]
+            T_product_out = T_product  # For recirc, outlet = tank (mixed)
+            T_water_out = y_eval[1]
+            water_flow = np.full(n, self.water.flow_rate)
+            product_flow = np.full(n, self.product.flow_rate)
+            product_fraction = np.ones(n)
 
-        return self.results
+        # Calculate Q for each point
+        Q = np.zeros(n)
+        for i in range(n):
+            if self.architecture == Architecture.SINGLE_PASS:
+                Q[i], _, T_water_out[i], _ = calculate_heat_transfer(
+                    self.product.initial_temp, self.water.inlet_temp,
+                    self.product, self.water, self.exchanger, 1.0
+                )
+            else:
+                Q[i], _, T_water_out[i], _ = calculate_heat_transfer(
+                    T_product[i], self.water.inlet_temp,
+                    self.product, self.water, self.exchanger, 1.0
+                )
 
-    def run_step_by_step(self, dt: float = 1.0) -> Dict:
-        """Run one time step. Use for real-time visualization."""
-        state = self.model.step(dt)
-        self.time += dt
+        # Cumulative energy
+        energy = np.cumsum(Q * np.diff(np.concatenate([[0], t_eval])))
 
-        Q = state['Q']
-        self.total_energy += Q * dt
+        # Constraint satisfaction
+        constraint_satisfied = T_water_out <= 36.0
 
-        self.results['time'].append(self.time)
-        self.results['T_tank'].append(self.model.T_tank)
-        self.results['T_hot_out'].append(self.model.T_hot_out)
-        self.results['T_cold_out'].append(self.model.T_cold_out)
-        self.results['Q'].append(Q)
-        self.results['flow_multiplier'].append(state['flow_multiplier'])
-        self.results['energy'].append(self.total_energy)
+        # Compute metrics
+        time_to_target = None
+        for i, T in enumerate(T_product):
+            if T <= self.config.target_temp:
+                time_to_target = t_eval[i]
+                break
 
-        return self.results
+        total_energy = energy[-1] if len(energy) > 0 else 0.0
+        avg_power = total_energy / t_eval[-1] if t_eval[-1] > 0 else 0.0
+        max_water_temp = np.max(T_water_out) if len(T_water_out) > 0 else 0.0
+
+        return SimulationResults(
+            t=t_eval,
+            T_product=T_product,
+            T_product_out=T_product_out,
+            T_water_in=np.full(n, self.water.inlet_temp),
+            T_water_out=T_water_out,
+            Q=Q,
+            energy=energy,
+            water_flow=water_flow,
+            product_flow=product_flow,
+            product_fraction=product_fraction,
+            constraint_satisfied=constraint_satisfied,
+            time_to_target=time_to_target,
+            total_energy=total_energy,
+            avg_power=avg_power,
+            max_water_temp=max_water_temp
+        )
+
+
+class MultiScenarioComparison:
+    """Compare multiple cooling scenarios."""
+
+    def __init__(self, config_base: SimulationConfig):
+        self.config_base = config_base
+
+    def run_all_scenarios(self) -> Dict[str, SimulationResults]:
+        """Run all 4 architectures.
+
+        Returns:
+            Dictionary mapping architecture name to results
+        """
+        results = {}
+
+        architectures = [
+            Architecture.RECIRC_NO_CONTROL,
+            Architecture.RECIRC_WATER_TEMP_CONTROL,
+            Architecture.RECIRC_BYPASS,
+            Architecture.SINGLE_PASS
+        ]
+
+        for arch in architectures:
+            config = SimulationConfig(
+                product=self.config_base.product,
+                water=self.config_base.water,
+                exchanger=self.config_base.exchanger,
+                architecture=arch,
+                t_end=self.config_base.t_end,
+                target_temp=self.config_base.target_temp
+            )
+
+            sim = BatchCoolingSimulator(config)
+            results[arch.value] = sim.run_simulation()
+
+        return results
+
+
+def create_comparison_table(results: Dict[str, SimulationResults]) -> Dict[str, dict]:
+    """Create comparison metrics for all scenarios.
+
+    Returns:
+        Dictionary with comparison metrics
+    """
+    comparison = {}
+
+    for name, res in results.items():
+        time_target = res.time_to_target if res.time_to_target else res.t[-1]
+        time_str = f"{time_target:.0f}s" if time_target else "Non atteint"
+
+        avg_water_flow = np.mean(res.water_flow) if len(res.water_flow) > 0 else 0
+
+        # Proxy for operational cost: water flow + pumping energy
+        pumping_proxy = avg_water_flow * 0.5  # Simplified
+
+        comparison[name] = {
+            "time_to_60°C": time_str,
+            "time_to_60°C_s": res.time_to_target if res.time_to_target else float('inf'),
+            "total_energy_MJ": res.total_energy / 1e6 if res.total_energy else 0,
+            "avg_power_kW": res.avg_power / 1000 if res.avg_power else 0,
+            "max_water_temp": f"{res.max_water_temp:.1f}°C" if res.max_water_temp else "N/A",
+            "constraint_met": res.max_water_temp <= 36.0 if res.max_water_temp else False,
+            "avg_water_flow_kg_s": avg_water_flow,
+            "pumping_proxy": pumping_proxy
+        }
+
+    return comparison
